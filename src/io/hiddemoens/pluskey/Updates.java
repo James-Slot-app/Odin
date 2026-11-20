@@ -27,15 +27,17 @@ final class Updates {
  void setAutomatic(boolean enabled){prefs().edit().putBoolean("automatic",enabled).apply();}
  void check(boolean manual){
   if(manual&&restorePending()){install();return;}
-  if(!manual&&(!automatic()||System.currentTimeMillis()-prefs().getLong("checked",0)<86400000L))return;
+  long now = System.currentTimeMillis();
+  if (!manual && (!automatic() || !UpdatePolicy.checkDue(now, prefs().getLong("checked", 0)))) return;
   if(!busy.compareAndSet(false,true)){if(manual)toast("Update check already running");return;}
+  prefs().edit().putLong("checked", now).apply();
   if(manual)toast("Checking for updates…");
   worker.execute(()->{
    try{
     HttpURLConnection connection=connect("https://api.github.com/repos/hiddemoens/PlusKey/releases/latest");
     String json;
-    try{int status=connection.getResponseCode();if(status==404){prefs().edit().putLong("checked",System.currentTimeMillis()).apply();if(manual)toast("No published release yet");return;}if(status!=200)throw new IOException("Release check unavailable");json=read(connection,1048576);}finally{connection.disconnect();}
-    JSONObject release=new JSONObject(json);prefs().edit().putLong("checked",System.currentTimeMillis()).apply();
+    try{int status=connection.getResponseCode();if(status==404){if(manual)toast("No published release yet");return;}if(status!=200)throw new IOException("Release check unavailable");json=read(connection,1048576);}finally{connection.disconnect();}
+    JSONObject release=new JSONObject(json);
     String installed=activity.getPackageManager().getPackageInfo(activity.getPackageName(),0).versionName;
     if(release.optBoolean("draft")||release.optBoolean("prerelease")||!UpdatePolicy.newer(release.optString("tag_name"),installed)){if(manual)toast("You’re up to date");return;}
     JSONArray assets=release.getJSONArray("assets");JSONObject apk=null;

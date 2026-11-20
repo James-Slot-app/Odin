@@ -6,6 +6,7 @@ import android.net.LocalSocketAddress;
 import android.os.FileObserver;
 import android.os.SystemClock;
 import java.io.*;
+import java.util.EnumSet;
 import java.util.concurrent.*;
 
 /** Runs through app_process with the identity authorized by ADB or Shizuku. */
@@ -29,12 +30,28 @@ public final class Helper {
     private LocalServerSocket server;
     private int appUid;
     private Thread controlThread;
-    private final File mailboxDir = new File("/sdcard/Android/data/io.hiddemoens.pluskey/files");
-    private final Mailbox mailbox = new Mailbox(mailboxDir);
-    private final PatternCapture capture = new PatternCapture(mailboxDir);
+    static final File MAILBOX_DIR = new File("/sdcard/Android/data/io.hiddemoens.pluskey/files");
+    private final Mailbox mailbox = new Mailbox(MAILBOX_DIR);
+    private final PatternCapture capture = new PatternCapture(MAILBOX_DIR);
     private final java.util.concurrent.atomic.AtomicLong releases = new java.util.concurrent.atomic.AtomicLong();
     private String heldTarget;
-    private final BlockingQueue<Boolean> mailboxChanged = new ArrayBlockingQueue<>(1);
+    private enum Change { STOP, TILE_QUERY, PREVIEW, STATUS_REQUEST, STATUS_CHANGED }
+    private final EnumSet<Change> changes = EnumSet.of(Change.STOP, Change.TILE_QUERY, Change.PREVIEW, Change.STATUS_REQUEST);
+
+    private void signal(Change change) {
+        synchronized (changes) {
+            if (changes.add(change)) changes.notifyAll();
+        }
+    }
+
+    private EnumSet<Change> awaitChanges() throws InterruptedException {
+        synchronized (changes) {
+            while (changes.isEmpty()) changes.wait();
+            EnumSet<Change> batch = changes.clone();
+            changes.clear();
+            return batch;
+        }
+    }
 
     private Helper() {
         actions.setRemoveOnCancelPolicy(true);
@@ -57,51 +74,74 @@ public final class Helper {
         if (!manual && !shizuku)
             throw new SecurityException("Start helper using supplied USB script");
         Helper helper = new Helper();
-        helper.controlThread = Thread.currentThread();
         helper.appUid = Integer.parseInt(args[0]);
         if (helper.appUid < 10000) throw new SecurityException("Invalid app UID");
         // Binding first ensures a second start cannot create a duplicate reader.
         helper.server = new LocalServerSocket(SOCKET);
-        helper.mailbox.clearStop();
-        helper.mailbox.publishVersion(VERSION);
-        helper.mailbox.publish("Starting|0|Starting input reader", System.currentTimeMillis());
-        Thread events = new Thread(helper::listen, "PlusLens-input");
-        events.setDaemon(true);
-        events.start();
-        Thread mailboxThread = new Thread(helper::watchMailbox, "PlusLens-status");
-        mailboxThread.setDaemon(true);
-        mailboxThread.start();
-        try {
-            while (helper.running) {
-                try (LocalSocket socket = helper.server.accept()) {
-                    if (!helper.running) break;
-                    int peer = socket.getPeerCredentials().getUid();
-                    if (peer != helper.appUid && peer != 2000 && peer != uid) continue;
-                    socket.setSoTimeout(1000);
-                    BufferedReader input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                    String command = input.readLine();
-                    PrintWriter output = new PrintWriter(socket.getOutputStream(), true);
-                    if ("STOP".equals(command)) {
-                        output.println("Stopped");
-                        helper.stop();
-                    } else if ("STATUS".equals(command)) {
-                        output.println(helper.statusLine());
-                    } else if ("VERSION".equals(command)) {
-                        output.println(VERSION);
-                    } else output.println("Unknown command");
-                } catch (IOException e) {
-                    if (helper.running) System.err.println("Client: " + e);
+        if (android.os.Looper.getMainLooper() == null) android.os.Looper.prepareMainLooper();
+        helper.controlThread = new Thread(() -> {
+            try { helper.serve(uid); }
+            catch (IOException error) { System.err.println("Helper stopped: " + error); }
+            finally { System.exit(0); }
+        }, "PlusKey-control");
+        helper.controlThread.start();
+        // Android services deliver their callbacks here. An idle Looper blocks in the kernel.
+        android.os.Looper.loop();
+    }
+
+    private void serve(int uid) throws IOException {
+        // Closing this descriptor also signals an abrupt helper exit to a visible activity.
+        try (FileOutputStream session = new FileOutputStream(new File(MAILBOX_DIR, Mailbox.SESSION_FILE))) {
+            mailbox.clearStop();
+            mailbox.consumePreview(); // Discard any preview left by a previous helper session.
+            mailbox.publishVersion(VERSION);
+            mailbox.publish("Starting|0|Starting input reader", System.currentTimeMillis());
+            Thread events = new Thread(this::listen, "PlusKey-input");
+            events.setDaemon(true);
+            events.start();
+            Thread mailboxThread = new Thread(this::watchMailbox, "PlusKey-status");
+            mailboxThread.setDaemon(true);
+            mailboxThread.start();
+            try {
+                acceptClients(uid);
+            } finally {
+                running = false;
+                mailboxThread.interrupt();
+                actions.shutdownNow();
+                Process reader = readerProcess;
+                if (reader != null) reader.destroy();
+                try {
+                    endHold();
+                    DeviceActions.shutdown();
+                } finally {
+                    server.close();
+                    publishStatus("Stopped|" + launches + "|Helper stopped", true);
                 }
             }
-        } finally {
-            helper.running = false;
-            mailboxThread.interrupt();
-            helper.actions.shutdownNow();
-            Process reader = helper.readerProcess;
-            if (reader != null) reader.destroy();
-            helper.server.close();
-            try{helper.publishStatus("Stopped|" + helper.launches + "|Helper stopped", true);}
-            finally{helper.endHold();DeviceActions.shutdown();System.exit(0);}
+        }
+    }
+
+    private void acceptClients(int uid) {
+        while (running) {
+            try (LocalSocket socket = server.accept()) {
+                if (!running) break;
+                int peer = socket.getPeerCredentials().getUid();
+                if (peer != appUid && peer != 2000 && peer != uid) continue;
+                socket.setSoTimeout(1000);
+                BufferedReader input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                String command = input.readLine();
+                PrintWriter output = new PrintWriter(socket.getOutputStream(), true);
+                if ("STOP".equals(command)) {
+                    output.println("Stopped");
+                    stop();
+                } else if ("STATUS".equals(command)) {
+                    output.println(statusLine());
+                } else if ("VERSION".equals(command)) {
+                    output.println(VERSION);
+                } else output.println("Unknown command");
+            } catch (IOException e) {
+                if (running) System.err.println("Client: " + e);
+            }
         }
     }
 
@@ -114,44 +154,37 @@ public final class Helper {
     }
 
     private void watchMailbox() {
-        FileObserver observer = new FileObserver(mailboxDir,
+        FileObserver observer = new FileObserver(MAILBOX_DIR,
             FileObserver.CREATE | FileObserver.MOVED_TO | FileObserver.CLOSE_WRITE) {
             @Override public void onEvent(int event, String path) {
-                if (("tile-query".equals(path) && event == FileObserver.CLOSE_WRITE) || Mailbox.STOP_REQUEST.equals(path) || Mailbox.PREVIEW_REQUEST.equals(path)
-                    || Mailbox.STATUS_REQUEST.equals(path)) {
-                    mailboxChanged.offer(true);
-                }
+                if (event == FileObserver.MOVED_TO && Mailbox.STOP_REQUEST.equals(path)) signal(Change.STOP);
+                else if (event == FileObserver.MOVED_TO && Mailbox.PREVIEW_REQUEST.equals(path)) signal(Change.PREVIEW);
+                else if (event == FileObserver.CREATE && Mailbox.STATUS_REQUEST.equals(path)) signal(Change.STATUS_REQUEST);
+                else if (event == FileObserver.CLOSE_WRITE && "tile-query".equals(path)) signal(Change.TILE_QUERY);
             }
         };
         try {
             observer.startWatching();
             String published = null;
-            String answered = null;
             while (running) {
-                if (mailbox.stopRequested()) {
+                EnumSet<Change> batch = awaitChanges();
+                if (batch.contains(Change.STOP) && mailbox.stopRequested()) {
                     stop();
                     break;
                 }
-                File query = new File(mailboxDir, "tile-query");
-                if (query.isFile() && query.length() <= 40) {
-                    try (BufferedReader in = new BufferedReader(new FileReader(query))) {
-                        String token = in.readLine();
-                        if (token != null && token.matches("[0-9a-f-]{36}") && !token.equals(answered)) {
-                            String specs = command("/system/bin/settings","get","secure","sysui_qs_tiles").trim();
-                            File next = new File(mailboxDir, "tile-reply.next");
-                            java.nio.file.Files.write(next.toPath(), java.util.Arrays.asList(token,specs));
-                            if (next.renameTo(new File(mailboxDir,"tile-reply"))) answered = token;
-                        }
-                    } catch (Exception unavailable) { System.err.println("Quick Settings list unavailable"); }
+                if (batch.contains(Change.TILE_QUERY)) answerTileQuery();
+                if (batch.contains(Change.PREVIEW)) {
+                    int preview = mailbox.consumePreview();
+                    if (preview != 0) enqueue(preview, true);
                 }
-                int preview = mailbox.consumePreview();
-                if (preview != 0) enqueue(preview, true);
-                String status = statusLine();
-                if (mailbox.consumeStatusRequest() || !status.equals(published)) {
-                    publishStatus(status, false);
-                    published = status;
+                boolean reply = batch.contains(Change.STATUS_REQUEST) && mailbox.consumeStatusRequest();
+                if (reply || batch.contains(Change.STATUS_CHANGED)) {
+                    String status = statusLine();
+                    if (reply || !status.equals(published)) {
+                        publishStatus(status, false);
+                        published = status;
+                    }
                 }
-                mailboxChanged.take();
             }
         } catch (InterruptedException ignored) {
             Thread.currentThread().interrupt();
@@ -161,6 +194,25 @@ public final class Helper {
         } finally {
             observer.stopWatching();
         }
+    }
+
+    private void answerTileQuery() {
+        File query = new File(MAILBOX_DIR, "tile-query");
+        if (!query.isFile() || query.length() > 40) return;
+        try (BufferedReader input = new BufferedReader(new FileReader(query))) {
+            String token = input.readLine();
+            if (token == null || !token.matches("[0-9a-f-]{36}")) return;
+            File reply = new File(MAILBOX_DIR, "tile-reply");
+            if (reply.isFile()) {
+                try (BufferedReader previous = new BufferedReader(new FileReader(reply))) {
+                    if (token.equals(previous.readLine())) return;
+                }
+            }
+            String specs = QuickTile.pinnedSpecs();
+            File next = new File(MAILBOX_DIR, "tile-reply.next");
+            java.nio.file.Files.write(next.toPath(), java.util.Arrays.asList(token, specs));
+            if (!next.renameTo(reply)) throw new IOException("Could not publish tile list");
+        } catch (Exception unavailable) { System.err.println("Quick Settings list unavailable"); }
     }
 
     private void stop() throws IOException {
@@ -181,11 +233,6 @@ public final class Helper {
         try {
             String device = KeyPress.device(command("/system/bin/getevent", "-pl"));
             if (device == null) throw new IOException("Plus Key input device not found");
-            Process reader = new ProcessBuilder("/system/bin/getevent", "-lt", device).redirectErrorStream(true).start();
-            readerProcess = reader;
-            state = "Listening";
-            mailboxChanged.offer(true);
-            System.out.println("Listening on " + device);
             ScheduledThreadPoolExecutor gestureTimer = new ScheduledThreadPoolExecutor(1, task -> {
                 Thread thread = new Thread(task, "PlusKey-gestures");
                 thread.setDaemon(true);
@@ -194,12 +241,8 @@ public final class Helper {
             gestureTimer.setRemoveOnCancelPolicy(true);
             KeyPress key = new KeyPress(gestureTimer, gesture -> enqueue(gesture, false), mailbox::activeGestures,
                 mailbox::clickInterval, this::released, capture::append, () -> capture.active() != null);
-            try (BufferedReader input = new BufferedReader(new InputStreamReader(reader.getInputStream()))) {
-                String line;
-                while (running && (line = input.readLine()) != null) {
-                    int gesture=key.gesture(line);
-                    if(gesture!=0)enqueue(gesture, false);
-                }
+            try {
+                readKeys(device, key);
             }
             finally { key.reset(); gestureTimer.shutdownNow(); released(); }
             if (running) throw new IOException("Input reader stopped");
@@ -207,12 +250,39 @@ public final class Helper {
             if (running) {
                 state = "Error";
                 last = clean(e.getMessage());
-                mailboxChanged.offer(true);
+                signal(Change.STATUS_CHANGED);
                 System.err.println(e);
             }
         } finally {
             Process reader = readerProcess;
             if (reader != null) reader.destroy();
+        }
+    }
+
+    private void listening(String device) {
+        state = "Listening";
+        signal(Change.STATUS_CHANGED);
+        System.out.println("Listening on " + device);
+    }
+
+    private void readKeys(String device, KeyPress key) throws IOException {
+        FileInputStream events;
+        try {
+            events = new FileInputStream(device);
+        } catch (FileNotFoundException restricted) {
+            // Some firmware grants its getevent executable access to input devices.
+            Process reader = new ProcessBuilder("/system/bin/getevent", "-lt", device).redirectErrorStream(true).start();
+            readerProcess = reader;
+            try (BufferedReader input = new BufferedReader(new InputStreamReader(reader.getInputStream()))) {
+                listening(device);
+                String line;
+                while (running && (line = input.readLine()) != null) key.gesture(line);
+            }
+            return;
+        }
+        try (FileInputStream input = events) {
+            listening(device);
+            InputEvents.read(input, android.os.Process.is64Bit(), key::gesture);
         }
     }
 
@@ -236,6 +306,11 @@ public final class Helper {
     }
 
     private static void wakeDisplay() throws Exception {
+        try {
+            if (DeviceActions.screenOn()) return;
+        } catch (Exception unavailable) {
+            // Keep wake support on firmware that restricts display queries.
+        }
         if (android.os.Build.VERSION.SDK_INT >= 37) {
             try {
                 String reply = command("/system/bin/cmd", "power", "wakeup");
@@ -260,7 +335,7 @@ public final class Helper {
             if (owned.startsWith("tile:")) QuickTile.end(owned); else DeviceActions.endHold(owned);
             last = "Held action finished";
         } catch (Exception error) { recordLaunchFailure(error); }
-        mailboxChanged.offer(true);
+        signal(Change.STATUS_CHANGED);
     }
 
     private synchronized void startHold(String target, long generation) throws Exception {
@@ -306,7 +381,7 @@ public final class Helper {
         } catch (Exception e) {
             recordLaunchFailure(e);
         } finally {
-            mailboxChanged.offer(true);
+            signal(Change.STATUS_CHANGED);
         }
     }
 
@@ -357,7 +432,7 @@ public final class Helper {
             if (!running || pendingUnlock != this) return;
             last = "Skipped: unlock timed out";
             finish();
-            mailboxChanged.offer(true);
+            signal(Change.STATUS_CHANGED);
         }
 
         void check() {
@@ -380,7 +455,7 @@ public final class Helper {
                 recordLaunchFailure(error);
             }
             finish();
-            mailboxChanged.offer(true);
+            signal(Change.STATUS_CHANGED);
         }
     }
 

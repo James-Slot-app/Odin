@@ -30,7 +30,6 @@ import rikka.shizuku.Shizuku;
 
 public final class MainActivity extends AppCompatActivity {
     private static final long MIN_TICK_SPACING_MS = 55;
-    private static final long STATUS_CHECK_MS = 2_000;
     private static final String LONG_PRESS_DEFAULT_SET = "long_press_default_set";
     private static final String LONG_PRESS_SETUP_HINT = "Set the OnePlus action to Do nothing to let Plus Key handle long press and remove the ‘Press and hold…’ warning.";
     private final Handler handler=new Handler(Looper.getMainLooper());
@@ -68,20 +67,26 @@ public final class MainActivity extends AppCompatActivity {
     };
     private Updates updates;
     private boolean resumePairingAfterPermission;
-    private FileObserver statusObserver;
+    private MailboxEvents.Subscription statusObserver;
     private int resumeGeneration;
+    private String currentStatus;
+    private boolean currentVersion;
     private final Runnable statusChanged = () -> refresh(false);
-    private final Runnable poll = new Runnable() {
-        @Override public void run() {
-            if (!resumed) return;
-            if (!ShizukuConnection.authorized()) shizukuAttempt = false;
-            else if (!shizukuAttempt && !wireless.busy.get() && !wireless.prefs().getBoolean("user_stopped", false)) {
-                shizukuAttempt = true;
-                wireless.start();
-            }
-            refresh(true);
-            handler.postDelayed(this, STATUS_CHECK_MS);
+    private final Runnable sessionEnded = () -> refresh(true);
+    private final Runnable connectionChanged = () -> {
+        if (!resumed) return;
+        renderStatus(currentStatus, currentVersion);
+        setup.refresh();
+    };
+    private final Shizuku.OnBinderReceivedListener binderReceived = () -> {
+        if (resumed) {
+            autoConnect();
+            connectionChanged.run();
         }
+    };
+    private final Shizuku.OnBinderDeadListener binderDead = () -> {
+        shizukuAttempt = false;
+        connectionChanged.run();
     };
     private int configuringGesture;
     private String configuringPackage;
@@ -165,7 +170,6 @@ public final class MainActivity extends AppCompatActivity {
         Ui.equal(this, second);
         customRows = Ui.column(this);
         root.addView(customRows);
-        rebuildPatterns();
         Ui.button(this,root,"Record pattern",false,v -> recordPattern());
         LinearLayout longPressSetup = Ui.card(this, root);
         longPressSetupCard = (View) longPressSetup.getParent();
@@ -187,7 +191,6 @@ public final class MainActivity extends AppCompatActivity {
             return insets;
         });
         setContentView(window);
-        showSelections();
     }
 
     private void attachGestureShelf(CoordinatorLayout page, View header, View photoLayer, ImageView softPhoto, LinearLayout content, View lastRow) {
@@ -224,7 +227,6 @@ public final class MainActivity extends AppCompatActivity {
         shelf.addView(shelfScroll, new LinearLayout.LayoutParams(-1, 0, 1));
         getOnBackPressedDispatcher().addCallback(this, settingsBack);
         BottomSheetBehavior<LinearLayout> behavior = new BottomSheetBehavior<>();
-        addShelfMotion(shelf, behavior);
         behavior.setHideable(false);
         CoordinatorLayout.LayoutParams layout = new CoordinatorLayout.LayoutParams(-1, -1);
         layout.setBehavior(behavior);
@@ -245,7 +247,7 @@ public final class MainActivity extends AppCompatActivity {
         castShadow.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         castShadow.setLayerType(View.LAYER_TYPE_SOFTWARE, null);
         page.addView(castShadow, 1, new CoordinatorLayout.LayoutParams(-1, shadowMargin + dp(32)));
-        shelf.getViewTreeObserver().addOnPreDrawListener(() -> {
+        Runnable positionEffects = () -> {
             castShadow.setTranslationY(shelf.getY() - shadowMargin);
             int travel = shelf.getHeight() - behavior.getPeekHeight();
             if (travel > 0) {
@@ -257,8 +259,9 @@ public final class MainActivity extends AppCompatActivity {
                 photoLayer.setScaleX(scale);
                 photoLayer.setScaleY(scale);
             }
-            return true;
-        });
+        };
+        addShelfMotion(shelf, behavior, positionEffects);
+        shelf.addOnLayoutChangeListener((v, l, t, r, b, oldL, oldT, oldR, oldB) -> positionEffects.run());
         Runnable sizeShelf = () -> {
             int height = page.getHeight();
             if (height == 0 || lastRow.getHeight() == 0) return;
@@ -275,6 +278,7 @@ public final class MainActivity extends AppCompatActivity {
                 shelf.setLayoutParams(layout);
             }
             if (behavior.getPeekHeight() != restingHeight) behavior.setPeekHeight(restingHeight);
+            positionEffects.run();
         };
         View.OnLayoutChangeListener resize = (v, l, t, r, b, oldL, oldT, oldR, oldB) -> {
             page.removeCallbacks(sizeShelf);
@@ -284,17 +288,19 @@ public final class MainActivity extends AppCompatActivity {
         lastRow.addOnLayoutChangeListener(resize);
     }
 
-    private void addShelfMotion(View shelf, BottomSheetBehavior<LinearLayout> behavior) {
+    private void addShelfMotion(View shelf, BottomSheetBehavior<LinearLayout> behavior, Runnable positionEffects) {
         SpringForce force = new SpringForce(0f)
             .setStiffness(getResources().getFloat(com.google.android.material.R.dimen.m3_sys_motion_expressive_spring_default_spatial_stiffness))
             .setDampingRatio(getResources().getFloat(com.google.android.material.R.dimen.m3_sys_motion_expressive_spring_default_spatial_damping));
         SpringAnimation recoil = new SpringAnimation(shelf, SpringAnimation.TRANSLATION_Y).setSpring(force);
+        recoil.addUpdateListener((animation, value, velocity) -> positionEffects.run());
         behavior.addBottomSheetCallback(new BottomSheetBehavior.BottomSheetCallback() {
             private long lastMove;
             private int lastTop;
             private float velocity;
 
             @Override public void onSlide(View view, float offset) {
+                positionEffects.run();
                 if (behavior.getState() != BottomSheetBehavior.STATE_DRAGGING) return;
                 long now = SystemClock.uptimeMillis();
                 long elapsed = now - lastMove;
@@ -309,6 +315,7 @@ public final class MainActivity extends AppCompatActivity {
                 if (state == BottomSheetBehavior.STATE_DRAGGING) {
                     recoil.cancel();
                     view.setTranslationY(0f);
+                    positionEffects.run();
                     lastTop = view.getTop();
                     lastMove = SystemClock.uptimeMillis();
                     velocity = 0f;
@@ -592,12 +599,12 @@ public final class MainActivity extends AppCompatActivity {
                 dialog.getButton(-1).setEnabled(valid);
             } catch (IOException error) { dialog.getButton(-1).setEnabled(false); }
         };
-        FileObserver observer = new FileObserver(dir, FileObserver.CLOSE_WRITE) {
-            public void onEvent(int event,String path) { if (PatternCapture.filename(token).equals(path)) handler.post(update); }
-        };
+        MailboxEvents.Subscription observer = MailboxEvents.watch(dir, (event, path) -> {
+            if (event == FileObserver.CLOSE_WRITE && PatternCapture.filename(token).equals(path)) handler.post(update);
+        });
         Runnable expire = dialog::dismiss;
-        dialog.setOnDismissListener(ignored -> { capture.stop(token); observer.stopWatching(); handler.removeCallbacks(expire); captureDialog = null; });
-        observer.startWatching(); dialog.show(); update.run(); handler.postDelayed(expire, PatternCapture.TIMEOUT);
+        dialog.setOnDismissListener(ignored -> { capture.stop(token); observer.close(); handler.removeCallbacks(expire); handler.removeCallbacks(update); captureDialog = null; });
+        dialog.show(); update.run(); handler.postDelayed(expire, PatternCapture.TIMEOUT);
         dialog.getButton(-1).setOnClickListener(view -> {
             try {
                 String value = capture.read(token);
@@ -707,7 +714,7 @@ public final class MainActivity extends AppCompatActivity {
         }
         try{String target=mailbox.selected(gesture);if(target==null)return;
             if(target.startsWith("hold:")){toast("Hold the physical Plus Key to test this action");return;}
-            if(target.startsWith("tile:") || target.startsWith("action:") || Options.mediaBranches(target) != null){String current=mailbox.readStatus(System.currentTimeMillis());if(current!=null&&current.startsWith("Listening|")){mailbox.requestPreview(gesture);return;}toast("Start your button first to preview this action");return;}
+            if(target.startsWith("tile:") || target.startsWith("action:") || Options.mediaBranches(target) != null){if(helperReady){mailbox.requestPreview(gesture);return;}toast("Start your button first to preview this action");return;}
             startActivities(Targets.intents(target));
         }catch(Exception error){toast("Action unavailable. Choose another.");}
     }
@@ -715,11 +722,11 @@ public final class MainActivity extends AppCompatActivity {
         wireless.prefs().edit().putBoolean("user_stopped",false).apply();
         if (ShizukuConnection.authorized()) {
             if (!wireless.busy.get()) shizukuAttempt = true;
-            wireless.start();refresh(true);return;
+            wireless.start();return;
         }
         if(!wireless.paired()||!setup.localAllowed()){setup.show();return;}
         if(!setup.wifiDebugging()&&!wireless.automatic()){setup.show();return;}
-        wireless.start();refresh(true);
+        wireless.start();
     }
     void authorizeShizuku() {
         try {
@@ -734,20 +741,17 @@ public final class MainActivity extends AppCompatActivity {
     private void watchStatus() {
         File dir = getExternalFilesDir(null);
         if (dir == null) return;
-        statusObserver = new FileObserver(dir, FileObserver.MOVED_TO) {
-            @Override public void onEvent(int event, String path) {
-                if (!Mailbox.STATUS_FILE.equals(path)) return;
-                handler.removeCallbacks(statusChanged);
-                handler.post(statusChanged);
-            }
-        };
-        try {
-            statusObserver.startWatching();
-        } catch (RuntimeException unavailable) {
-            android.util.Log.w("PlusKey", "Status callbacks unavailable", unavailable);
-        }
+        statusObserver = MailboxEvents.watch(dir, (event, path) -> {
+            Runnable callback;
+            if (event == FileObserver.MOVED_TO && Mailbox.STATUS_FILE.equals(path)) callback = statusChanged;
+            else if (event == FileObserver.CLOSE_WRITE && Mailbox.SESSION_FILE.equals(path)) callback = sessionEnded;
+            else return;
+            handler.removeCallbacks(callback);
+            handler.post(callback);
+        });
     }
-    private void refresh(boolean checkLiveness) {
+
+    private void refresh(boolean requestReply) {
         if (!resumed) return;
         int generation = resumeGeneration;
         worker.execute(() -> {
@@ -755,16 +759,19 @@ public final class MainActivity extends AppCompatActivity {
             boolean matchingVersion = false;
             try {
                 matchingVersion = Helper.VERSION.equals(mailbox.runningVersion());
-                long now = System.currentTimeMillis();
-                value = checkLiveness && matchingVersion && !wireless.prefs().getBoolean("user_stopped", false)
-                    ? mailbox.refreshStatus(now) : mailbox.readStatus(now);
+                if (requestReply && matchingVersion) {
+                    if (!wireless.prefs().getBoolean("user_stopped", false)) mailbox.requestStatus();
+                } else {
+                    value = mailbox.readStatus(System.currentTimeMillis());
+                }
             } catch (IOException ignored) { }
             final String current = value;
             final boolean versionOkay = matchingVersion;
             runOnUiThread(() -> {
-                if (!resumed || resumeGeneration != generation || isDestroyed()) return;
-                renderStatus(current, versionOkay);
-                if (checkLiveness) setup.refresh();
+                if (!resumed || resumeGeneration != generation) return;
+                currentStatus = current;
+                currentVersion = versionOkay;
+                connectionChanged.run();
             });
         });
     }
@@ -822,21 +829,51 @@ public final class MainActivity extends AppCompatActivity {
     }}
     private void toast(String message){Toast.makeText(this,message,Toast.LENGTH_LONG).show();}
     private int dp(int value){return Ui.dp(this,value);}
-    protected void onResume(){super.onResume();resumed=true;resumeGeneration++;watchStatus();handler.post(poll);if(updates!=null){updates.resumed();updates.check(false);}rebuildPatterns();showSelections();
-        boolean pendingAutomatic=wireless.prefs().getBoolean("automatic_requested",false)&&setup.wifiDebugging();
-        if(!ShizukuConnection.authorized()&&(!autoAttempt||pendingAutomatic)&&wireless.canUseWireless()&&!wireless.prefs().getBoolean("user_stopped",false)){
-            autoAttempt=true;try{String current=mailbox.readStatus(System.currentTimeMillis());if(current==null||!current.startsWith("Listening|")||!Helper.VERSION.equals(mailbox.runningVersion())||wireless.prefs().getBoolean("automatic_requested",false)||wireless.automatic())wireless.start();}catch(IOException ignored){}
+    private boolean autoConnect() {
+        if (wireless.busy.get() || wireless.prefs().getBoolean("user_stopped", false)) return false;
+        if (ShizukuConnection.authorized()) {
+            if (shizukuAttempt) return false;
+            shizukuAttempt = true;
+        } else {
+            shizukuAttempt = false;
+            boolean pending = wireless.prefs().getBoolean("automatic_requested", false) && setup.wifiDebugging();
+            if ((autoAttempt && !pending) || !wireless.canUseWireless()) return false;
+            autoAttempt = true;
         }
+        wireless.start();
+        return true;
     }
-    protected void onPause(){
+
+    @Override protected void onResume() {
+        super.onResume();
+        resumed = true;
+        resumeGeneration++;
+        currentStatus = null;
+        currentVersion = false;
+        watchStatus();
+        wireless.addListener(connectionChanged);
+        Shizuku.addBinderReceivedListener(binderReceived);
+        Shizuku.addBinderDeadListener(binderDead);
+        if (!autoConnect()) refresh(true);
+        connectionChanged.run();
+        updates.resumed();
+        updates.check(false);
+        rebuildPatterns();
+        showSelections();
+    }
+
+    @Override protected void onPause() {
         if (captureDialog != null) captureDialog.dismiss();
-        resumed=false;
+        resumed = false;
+        wireless.removeListener(connectionChanged);
+        Shizuku.removeBinderReceivedListener(binderReceived);
+        Shizuku.removeBinderDeadListener(binderDead);
         if (statusObserver != null) {
-            statusObserver.stopWatching();
+            statusObserver.close();
             statusObserver = null;
         }
         handler.removeCallbacks(statusChanged);
-        handler.removeCallbacks(poll);
+        handler.removeCallbacks(sessionEnded);
         super.onPause();
     }
     protected void onDestroy(){Shizuku.removeRequestPermissionResultListener(shizukuPermission);worker.shutdownNow();if(updates!=null)updates.close();super.onDestroy();}

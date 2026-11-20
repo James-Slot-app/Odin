@@ -6,12 +6,13 @@ final class Mailbox {
     static final String PREVIEW_REQUEST = "preview-request";
     static final String STATUS_REQUEST = "status-request";
     static final String STATUS_FILE = "helper-status";
+    static final String SESSION_FILE = "helper-session";
     static final int MIN_CLICK_INTERVAL_MS = 100;
     static final int MAX_CLICK_INTERVAL_MS = 500;
     static final int DEFAULT_CLICK_INTERVAL_MS = 200;
     private static final String CLICK_INTERVAL_FILE = "click-interval";
+    private static final java.util.regex.Pattern PATTERN_FILE = java.util.regex.Pattern.compile("gesture-[.-]{1,8}");
     private static final long STATUS_MAX_AGE_MS = 7_000;
-    private static final long STATUS_REFRESH_AGE_MS = 2_000;
     private final File dir;
     private static String targetFile(int gesture) {
         switch (gesture) {
@@ -42,20 +43,25 @@ final class Mailbox {
 
     private File marker(int gesture) { return new File(dir, "gesture-" + GesturePatterns.text(gesture)); }
     Set<Integer> patterns() {
-        Set<Integer> result = new TreeSet<>();
-        String[] names = dir == null ? null : dir.list((parent,name) -> name.matches("gesture-[.-]{1,8}"));
-        if (names != null) for (String name : names) {
-            int id = GesturePatterns.id(name.substring(8));
-            if (id > KeyPress.TRIPLE) result.add(id);
-        }
-        return result;
+        return gestureIds(false);
     }
     Set<Integer> activeGestures() {
-        Set<Integer> result = patterns();
-        result.removeIf(id -> !new File(dir, targetFile(id)).exists());
-        result.add(KeyPress.SHORT);
-        for (int id = KeyPress.LONG; id <= KeyPress.TRIPLE; id++)
-            if (new File(dir, targetFile(id)).exists()) result.add(id);
+        return gestureIds(true);
+    }
+    private Set<Integer> gestureIds(boolean assignedOnly) {
+        String[] listing = dir == null ? null : dir.list();
+        Set<String> names = listing == null ? Collections.emptySet() : new HashSet<>(Arrays.asList(listing));
+        Set<Integer> result = new TreeSet<>();
+        for (String name : names) {
+            if (!name.startsWith("gesture-") || !PATTERN_FILE.matcher(name).matches()) continue;
+            int id = GesturePatterns.id(name.substring(8));
+            if (id > KeyPress.TRIPLE && (!assignedOnly || names.contains(targetFile(id)))) result.add(id);
+        }
+        if (assignedOnly) {
+            result.add(KeyPress.SHORT);
+            for (int id = KeyPress.LONG; id <= KeyPress.TRIPLE; id++)
+                if (names.contains(targetFile(id))) result.add(id);
+        }
         return result;
     }
     void addPattern(int id) throws IOException {
@@ -137,23 +143,15 @@ final class Mailbox {
     void publishVersion(String version)throws IOException {try(FileOutputStream output=new FileOutputStream(new File(dir,"helper-version"))){output.write(version.getBytes("UTF-8"));}}
     String runningVersion()throws IOException {try(BufferedReader input=new BufferedReader(new FileReader(new File(dir,"helper-version")))){return input.readLine();}catch(FileNotFoundException e){return "";}}
     String readStatus(long now) throws IOException {
-        return readStatus(now, false);
-    }
-    String refreshStatus(long now) throws IOException {
-        return readStatus(now, true);
-    }
-    private String readStatus(long now, boolean refresh) throws IOException {
         if (dir == null) return null;
-        long age = Long.MAX_VALUE;
         String status = null;
         try (BufferedReader reader = new BufferedReader(new FileReader(new File(dir, STATUS_FILE)))) {
             String first = reader.readLine();
             if (first != null) {
-                age = now - Long.parseLong(first);
+                long age = now - Long.parseLong(first);
                 if (age >= 0 && age <= STATUS_MAX_AGE_MS) status = reader.readLine();
             }
         } catch (FileNotFoundException | NumberFormatException ignored) { }
-        if (refresh && (status == null || age >= STATUS_REFRESH_AGE_MS)) requestStatus();
         return status;
     }
     void requestStatus() throws IOException {

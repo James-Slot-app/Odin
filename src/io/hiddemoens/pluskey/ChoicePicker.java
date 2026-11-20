@@ -91,6 +91,7 @@ final class ChoicePicker {
     private ImageButton back;
     private View timingButton, removeButton;
     private boolean browsingApps, loading;
+    private Thread appLoader;
     private final Rows rows = new Rows();
 
     ChoicePicker(Context context, Selected selected) {
@@ -111,6 +112,9 @@ final class ChoicePicker {
         actions.add(new Entry(new Targets.Choice("App fan", "fan:"), null));
         sheet = new BottomSheetDialog(context);
         sheet.setDismissWithAnimation(true);
+        sheet.setOnDismissListener(dialog -> {
+            if (appLoader != null) appLoader.interrupt();
+        });
         LinearLayout body = Ui.column(context);
         body.setPadding(dp(18), dp(12), dp(18), dp(14));
         body.setFocusableInTouchMode(true);
@@ -219,7 +223,7 @@ final class ChoicePicker {
 
     private void loadApps() {
         loading = true;
-        new Thread(() -> {
+        appLoader = new Thread(() -> {
             PackageManager pm = context.getPackageManager();
             Map<String, AppGroup> groups = new HashMap<>();
             addHandlers(groups, new Intent(android.provider.MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA_SECURE), Options.SECURE_CAMERA, "Secure camera");
@@ -227,7 +231,8 @@ final class ChoicePicker {
             addHandlers(groups, new Intent(android.speech.RecognizerIntent.ACTION_VOICE_SEARCH_HANDS_FREE), "voice:", "Hands-free voice");
             addHandlers(groups, new Intent(Intent.ACTION_CREATE_SHORTCUT), "configure:", "Configure shortcut");
             Set<String> scanned = new HashSet<>();
-            for (ResolveInfo app : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)) {
+            for (ResolveInfo app : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), PackageManager.GET_META_DATA)) {
+                if (Thread.currentThread().isInterrupted()) return;
                 if (!app.activityInfo.exported || context.getPackageName().equals(app.activityInfo.packageName)) continue;
                 String owner = app.activityInfo.packageName;
                 String target = new ComponentName(owner, app.activityInfo.name).flattenToString();
@@ -236,13 +241,16 @@ final class ChoicePicker {
                 String name = app.loadLabel(pm).toString();
                 group.add(new Targets.Choice(name, target), app, name.equals(group.title) ? "Open app" : "Open " + name);
                 if (scanned.add(owner)) {
-                    for (Targets.Choice locked : Targets.lockedActivities(context, owner, group.targets.contains(Options.SECURE_CAMERA + owner)))
+                    for (Targets.Choice locked : Targets.lockedActivities(context, group.info, group.title, group.targets.contains(Options.SECURE_CAMERA + owner)))
                         group.add(locked, app, locked.label);
                 }
                 for (Targets.Choice shortcut : Targets.shortcuts(context, app)) group.add(shortcut, app, shortcut.label);
             }
-            Set<String> pinned = QuickTiles.pinned(context);
-            for (ResolveInfo tile : QuickTiles.discover(context, null)) {
+            if (Thread.currentThread().isInterrupted()) return;
+            List<ResolveInfo> tiles = QuickTiles.discover(context, null);
+            Set<String> pinned = tiles.isEmpty() ? Collections.emptySet() : QuickTiles.pinned(context);
+            for (ResolveInfo tile : tiles) {
+                if (Thread.currentThread().isInterrupted()) return;
                 String target = "tile:" + new ComponentName(tile.serviceInfo.packageName, tile.serviceInfo.name).flattenToString();
                 if (!Options.isTile(target) || !pinned.contains(target.substring(5))) continue;
                 AppGroup group = group(groups, tile.serviceInfo.applicationInfo);
@@ -255,11 +263,13 @@ final class ChoicePicker {
             for (AppGroup group : found) group.children.sort(Comparator.comparing((Entry entry) -> entry.title, collator).thenComparing(entry -> entry.choice.target));
             context.getMainExecutor().execute(() -> {
                 if (!sheet.isShowing()) return;
+                appLoader = null;
                 apps = found;
                 loading = false;
                 refresh();
             });
-        }, "PlusKey-app-picker").start();
+        }, "PlusKey-app-picker");
+        appLoader.start();
     }
 
     private AppGroup group(Map<String, AppGroup> groups, ApplicationInfo info) {

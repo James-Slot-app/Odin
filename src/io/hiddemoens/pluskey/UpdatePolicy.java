@@ -1,5 +1,8 @@
 package io.hiddemoens.pluskey;
 final class UpdatePolicy {
+ static boolean checkDue(long now, long lastAttempt) {
+  return lastAttempt == 0 || now < lastAttempt || now - lastAttempt >= java.util.concurrent.TimeUnit.DAYS.toMillis(1);
+ }
  static boolean newer(String release,String current){
   if(release==null||current==null)return false;
   release=release.replaceFirst("^v","");

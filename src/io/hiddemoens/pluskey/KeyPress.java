@@ -32,6 +32,7 @@ final class KeyPress {
     private long lastReleaseUs;
     private long eventDownUs = -1;
     private boolean holdRecognized;
+    private boolean usesHolds;
     private boolean releaseDue;
     private boolean capturePress;
 
@@ -56,12 +57,16 @@ final class KeyPress {
 
     boolean accept(String line) { return gesture(line) == SHORT; }
 
-    synchronized int gesture(String line) {
+    int gesture(String line) {
         Matcher match = EVENT.matcher(line);
         if (!match.matches()) return 0;
         String value = match.group(2);
         long eventUs = Math.round(Double.parseDouble(match.group(1)) * 1_000_000);
-        if (value.equals("DOWN") && eventDownUs < 0) {
+        return gesture(eventUs, value.equals("DOWN") ? 1 : value.equals("UP") ? 0 : 2);
+    }
+
+    synchronized int gesture(long eventUs, int value) {
+        if (value == 1 && eventDownUs < 0) {
             capturePress = capturing.getAsBoolean();
             cancelClickTimer();
             long gapUs = eventUs - lastReleaseUs;
@@ -69,12 +74,13 @@ final class KeyPress {
             else if (gapUs < 0 || gapUs >= clickIntervalMs * 1000L) resolve(false, false, false);
             eventDownUs = eventUs;
             holdRecognized = false;
-            if (timer != null) {
+            if (!capturePress && pending.isEmpty()) loadPatterns();
+            if (timer != null && (capturePress || usesHolds)) {
                 long id = ++pressId;
                 pendingHold = timer.schedule(() -> fireHold(id), HOLD_MS, TimeUnit.MILLISECONDS);
             }
         }
-        if (!value.equals("UP") || eventDownUs < 0) return 0;
+        if (value != 0 || eventDownUs < 0) return 0;
         if (pendingHold != null) {
             pendingHold.cancel(false);
             pendingHold = null;
@@ -119,17 +125,24 @@ final class KeyPress {
             if (recording) captureSymbol.accept(symbol);
             return 0;
         }
-        if (pending.isEmpty()) {
-            clickIntervalMs = interval.getAsInt();
-            patterns.clear();
-            if (activeGestureIds == null) {
-                patterns.add("."); patterns.add("-"); patterns.add(".."); patterns.add("...");
-            } else {
-                for (int id : activeGestureIds.get()) patterns.add(GesturePatterns.text(id));
-            }
-        }
         pending += symbol;
         return resolve(clickIntervalMs > 0 && timer != null, true, onUp && activeGestureIds == null);
+    }
+
+    private void loadPatterns() {
+        patterns.clear();
+        if (activeGestureIds == null) {
+            patterns.add("."); patterns.add("-"); patterns.add(".."); patterns.add("...");
+        } else {
+            for (int id : activeGestureIds.get()) patterns.add(GesturePatterns.text(id));
+        }
+        usesHolds = false;
+        boolean multiPress = false;
+        for (String pattern : patterns) {
+            usesHolds |= pattern.indexOf('-') >= 0;
+            multiPress |= pattern.length() > 1;
+        }
+        clickIntervalMs = multiPress ? interval.getAsInt() : 0;
     }
 
     private boolean hasExtension(String prefix) {

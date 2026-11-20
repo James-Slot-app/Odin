@@ -36,10 +36,10 @@ final class Targets {
     static ArrayList<Choice> shortcuts(Context context,ResolveInfo app){
         ArrayList<Choice> found=new ArrayList<>();String owner=app.activityInfo.packageName;
         try{
-            ActivityInfo info=context.getPackageManager().getActivityInfo(new ComponentName(owner,app.activityInfo.name),PackageManager.GET_META_DATA);
+            ActivityInfo info=app.activityInfo;
             int resource=info.metaData==null?0:info.metaData.getInt("android.app.shortcuts",0);
             if(resource==0)return found;
-            Resources resources=context.getPackageManager().getResourcesForApplication(owner);
+            Resources resources=context.getPackageManager().getResourcesForApplication(info.applicationInfo);
             try(XmlResourceParser parser=resources.getXml(resource)){
                 String label=null;boolean enabled=false;ArrayList<Intent> intents=new ArrayList<>();
                 int event;
@@ -68,12 +68,13 @@ final class Targets {
         }catch(Exception ignored){}
         return found;
     }
-    static List<Choice> lockedActivities(Context context, String owner, boolean hasSecureCamera) {
+    static List<Choice> lockedActivities(Context context, ApplicationInfo app, String appLabel, boolean hasSecureCamera) {
         List<Choice> choices = new ArrayList<>();
+        String owner = app.packageName;
         PackageManager pm = context.getPackageManager();
         String android = "http://schemas.android.com/apk/res/android";
         try {
-            Resources resources = pm.getResourcesForApplication(owner);
+            Resources resources = pm.getResourcesForApplication(app);
             Set<String> declared = new HashSet<>();
             try (XmlResourceParser xml = resources.getAssets().openXmlResourceParser("AndroidManifest.xml")) {
                 while (xml.next() != XmlPullParser.END_DOCUMENT) {
@@ -90,7 +91,6 @@ final class Targets {
             if (declared.isEmpty()) return choices;
             ActivityInfo[] activities = pm.getPackageInfo(owner, PackageManager.GET_ACTIVITIES).activities;
             if (activities == null) return choices;
-            String appLabel = pm.getApplicationLabel(pm.getApplicationInfo(owner, 0)).toString();
             Set<String> labels = new HashSet<>();
             for (ActivityInfo info : activities) {
                 if (!declared.contains(info.targetActivity == null ? info.name : info.targetActivity)

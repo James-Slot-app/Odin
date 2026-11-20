@@ -5,6 +5,7 @@ import android.content.Context;
 import android.hardware.camera2.*;
 import android.hardware.display.DisplayManager;
 import android.media.AudioManager;
+import android.media.session.MediaSessionManager;
 import android.os.*;
 import android.net.wifi.WifiManager;
 import android.telephony.SubscriptionInfo;
@@ -13,47 +14,61 @@ import android.telephony.TelephonyManager;
 import java.util.List;
 import android.provider.Settings;
 import android.view.Display;
+import android.view.KeyEvent;
 import java.util.concurrent.*;
 
 /** Invoked only by the already-authorized shell helper, using shell attribution. */
 final class DeviceActions {
     private static final String OPLUS_DATA_SLOT = "oplus_customize_multi_sim_network_primary_slot";
     private static Context context;
-    private static CameraManager camera;
     private static String cameraId;
-    private static final LightState light = new LightState();
-
+    private static TorchWatch heldTorch;
     private static final Binder recordingClient = new Binder();
     private static String heldRecording;
-    private static HandlerThread cameraThread;
-    private static synchronized Context context()throws Exception{
-        if(context==null){
-            if(Looper.myLooper()==null)Looper.prepare();
-            Class<?> thread=Class.forName("android.app.ActivityThread");
-            Object system=thread.getMethod("systemMain").invoke(null);
-            Context base=(Context)thread.getMethod("getSystemContext").invoke(system);
-            Context shell = base.createPackageContext("com.android.shell", 0);
-            // createPackageContext inherits the system context's "android" operation attribution.
-            // Construct an app context for the package that actually owns this process UID.
-            java.lang.reflect.Field info = base.getClass().getDeclaredField("mPackageInfo");
-            info.setAccessible(true);
-            java.lang.reflect.Method create = base.getClass().getDeclaredMethod("createAppContext",
-                thread, Class.forName("android.app.LoadedApk"));
-            create.setAccessible(true);
-            context = (Context) create.invoke(null, system, info.get(shell));
+
+    private static synchronized Context context() throws Exception {
+        if (context == null) {
+            FutureTask<Context> initialize = new FutureTask<>(DeviceActions::createShellContext);
+            new Handler(Looper.getMainLooper()).post(initialize);
+            try {
+                context = initialize.get();
+            } catch (ExecutionException failed) {
+                if (failed.getCause() instanceof Exception) throw (Exception) failed.getCause();
+                throw failed;
+            }
         }
         return context;
+    }
+
+    private static Context createShellContext() throws Exception {
+        Class<?> thread=Class.forName("android.app.ActivityThread");
+        Object system=thread.getMethod("systemMain").invoke(null);
+        Context base=(Context)thread.getMethod("getSystemContext").invoke(system);
+        Context shell = base.createPackageContext("com.android.shell", 0);
+        // createPackageContext inherits the system context's "android" operation attribution.
+        // Construct an app context for the package that actually owns this process UID.
+        java.lang.reflect.Field info = base.getClass().getDeclaredField("mPackageInfo");
+        info.setAccessible(true);
+        java.lang.reflect.Method create = base.getClass().getDeclaredMethod("createAppContext",
+            thread, Class.forName("android.app.LoadedApk"));
+        create.setAccessible(true);
+        return (Context) create.invoke(null, system, info.get(shell));
+    }
+    static String pinnedTiles() throws Exception {
+        return Settings.Secure.getString(context().getContentResolver(), "sysui_qs_tiles");
     }
     static String nativeLongPressAction() throws Exception {
         return Settings.System.getString(context().getContentResolver(), Helper.ONEPLUS_ACTION_SETTING);
     }
-    static boolean isAwakeAndUnlocked() throws Exception {
+    static boolean screenOn() throws Exception {
         Context ctx = context();
         if (!ctx.getSystemService(PowerManager.class).isInteractive()) return false;
         Display display = ctx.getSystemService(DisplayManager.class).getDisplay(Display.DEFAULT_DISPLAY);
         if (display == null) throw new IllegalStateException("Default display unavailable");
-        return display.getState() == Display.STATE_ON
-            && !ctx.getSystemService(KeyguardManager.class).isKeyguardLocked();
+        return display.getState() == Display.STATE_ON;
+    }
+    static boolean isAwakeAndUnlocked() throws Exception {
+        return screenOn() && !context().getSystemService(KeyguardManager.class).isKeyguardLocked();
     }
     static Runnable watchUnlock(Executor executor, Runnable changed) throws Exception {
         if (Build.VERSION.SDK_INT < 36) {
@@ -97,12 +112,17 @@ final class DeviceActions {
                 return heldRecording != null;
             }
             if (!"action:torch".equals(target)) return false;
-            prepareLight(context());
-            synchronized (light) {
-                if (!light.canHold()) return false;
-                camera.setTorchMode(cameraId, true);
-                light.requested(true, true);
-                return true;
+            if (heldTorch != null) return false;
+            TorchWatch torch = openTorch(context());
+            try {
+                synchronized (torch) {
+                    if (!torch.state.canHold()) return false;
+                    torch.set(true, true);
+                    heldTorch = torch;
+                    return true;
+                }
+            } finally {
+                if (heldTorch != torch) torch.close();
             }
         } catch (Exception error) {
             System.err.println("Cannot start hold: " + error.getMessage());
@@ -115,11 +135,12 @@ final class DeviceActions {
             if ("action:record".equals(target) && heldRecording != null) {
                 recordingCommand("stop", heldRecording, null);
                 heldRecording = null;
-            } else if ("action:torch".equals(target)) {
-                synchronized (light) {
-                    if (!light.held) return;
-                    camera.setTorchMode(cameraId, false);
-                    light.requested(false, false);
+            } else if ("action:torch".equals(target) && heldTorch != null) {
+                try (TorchWatch torch = heldTorch) {
+                    heldTorch = null;
+                    synchronized (torch) {
+                        if (torch.state.held) torch.set(false, false);
+                    }
                 }
             }
         } catch (Exception error) { System.err.println("Cannot end hold: " + error.getMessage()); }
@@ -177,33 +198,98 @@ final class DeviceActions {
         }
     }
 
-    private static void prepareLight(Context ctx) throws Exception {
-        if (camera != null) return;
+    private static TorchWatch openTorch(Context ctx) throws Exception {
         CameraManager manager = ctx.getSystemService(CameraManager.class);
-        for (String id : manager.getCameraIdList()) {
-            CameraCharacteristics info = manager.getCameraCharacteristics(id);
-            if (Boolean.TRUE.equals(info.get(CameraCharacteristics.FLASH_INFO_AVAILABLE))) {
-                cameraId = id;
-                if (Integer.valueOf(CameraCharacteristics.LENS_FACING_BACK).equals(info.get(CameraCharacteristics.LENS_FACING))) break;
+        if (cameraId == null) {
+            for (String id : manager.getCameraIdList()) {
+                CameraCharacteristics info = manager.getCameraCharacteristics(id);
+                if (Boolean.TRUE.equals(info.get(CameraCharacteristics.FLASH_INFO_AVAILABLE))) {
+                    cameraId = id;
+                    if (Integer.valueOf(CameraCharacteristics.LENS_FACING_BACK).equals(info.get(CameraCharacteristics.LENS_FACING))) break;
+                }
             }
         }
         if (cameraId == null) throw new IllegalStateException("No flashlight available");
-        CountDownLatch initial = new CountDownLatch(1);
-        cameraThread = new HandlerThread("PlusKey-light");
-        cameraThread.start();
+        TorchWatch torch = new TorchWatch(manager, cameraId);
+        manager.registerTorchCallback(torch, new Handler(Looper.getMainLooper()));
         try {
-            manager.registerTorchCallback(new CameraManager.TorchCallback() {
-                @Override public void onTorchModeChanged(String id, boolean enabled) { update(id, enabled); }
-                @Override public void onTorchModeUnavailable(String id) { update(id, null); }
-                private void update(String id, Boolean enabled) {
-                    if (!id.equals(cameraId)) return;
-                    synchronized (light) { light.observed(enabled); }
-                    initial.countDown();
+            torch.initial.await(1, TimeUnit.SECONDS);
+            return torch;
+        } catch (InterruptedException error) {
+            torch.close();
+            throw error;
+        }
+    }
+
+    private static final class TorchWatch extends CameraManager.TorchCallback implements AutoCloseable {
+        final CameraManager manager;
+        final String id;
+        final LightState state = new LightState();
+        final CountDownLatch initial = new CountDownLatch(1);
+
+        TorchWatch(CameraManager manager, String id) { this.manager = manager; this.id = id; }
+        @Override public void onTorchModeChanged(String id, boolean enabled) { observed(id, enabled); }
+        @Override public void onTorchModeUnavailable(String id) { observed(id, null); }
+
+        private synchronized void observed(String changedId, Boolean enabled) {
+            if (!id.equals(changedId)) return;
+            state.observed(enabled);
+            initial.countDown();
+            notifyAll();
+        }
+
+        // Called with this watch locked. Keep a held watch through release. For a toggle,
+        // wait for the service acknowledgment before allowing another press to sample it.
+        void set(boolean enabled, boolean hold) throws Exception {
+            manager.setTorchMode(id, enabled);
+            state.requested(enabled, hold);
+            if (hold) return;
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+            while (state.changing()) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) break;
+                TimeUnit.NANOSECONDS.timedWait(this, remaining);
+            }
+        }
+
+        @Override public void close() { manager.unregisterTorchCallback(this); }
+    }
+
+    private static MediaSessionManager mediaSessions;
+
+    private static MediaSessionManager mediaSessions(Context ctx) throws ReflectiveOperationException {
+        if (mediaSessions == null) {
+            // A standalone app_process does not inherit the media module's Zygote setup.
+            if (Build.VERSION.SDK_INT >= 31) {
+                Class<?> initializer = Class.forName("android.media.MediaFrameworkPlatformInitializer");
+                if (initializer.getMethod("getMediaServiceManager").invoke(null) == null) {
+                    Class<?> manager = Class.forName("android.media.MediaServiceManager");
+                    initializer.getMethod("setMediaServiceManager", manager).invoke(null, manager.getConstructor().newInstance());
                 }
-            }, new Handler(cameraThread.getLooper()));
-        } catch (RuntimeException error) { cameraThread.quitSafely(); throw error; }
-        camera = manager;
-        initial.await(1, TimeUnit.SECONDS);
+            }
+            mediaSessions = ctx.getSystemService(MediaSessionManager.class);
+        }
+        return mediaSessions;
+    }
+
+    private static void audioKey(int code) throws Exception {
+        try {
+            Context ctx = context();
+            MediaSessionManager sessions = mediaSessions(ctx);
+            if (code == KeyEvent.KEYCODE_VOLUME_UP || code == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                int direction = code == KeyEvent.KEYCODE_VOLUME_UP ? AudioManager.ADJUST_RAISE : AudioManager.ADJUST_LOWER;
+                int flags = ctx.getSystemService(PowerManager.class).isInteractive() ? AudioManager.FLAG_SHOW_UI : 0;
+                MediaSessionManager.class.getMethod("dispatchAdjustVolume", int.class, int.class, int.class)
+                    .invoke(sessions, AudioManager.USE_DEFAULT_STREAM_TYPE, direction, flags);
+            } else {
+                java.lang.reflect.Method dispatch = MediaSessionManager.class.getMethod("dispatchMediaKeyEvent", KeyEvent.class, boolean.class);
+                long time = SystemClock.uptimeMillis();
+                dispatch.invoke(sessions, new KeyEvent(time, time, KeyEvent.ACTION_DOWN, code, 0), false);
+                dispatch.invoke(sessions, new KeyEvent(time, time, KeyEvent.ACTION_UP, code, 0), false);
+            }
+        } catch (ReflectiveOperationException | RuntimeException restricted) {
+            Helper.command("/system/bin/input", "keyevent", Integer.toString(code));
+        }
     }
 
     static synchronized void run(String action)throws Exception{
@@ -213,11 +299,14 @@ final class DeviceActions {
             case "action:previous_app":
                 previousApp(context());
                 return;
-            case "action:media_pause":code="127";break;
+            case "action:media_pause": audioKey(KeyEvent.KEYCODE_MEDIA_PAUSE); return;
             case "action:assistant":code=String.valueOf(android.view.KeyEvent.KEYCODE_VOICE_ASSIST);break;
             case "action:screenshot":code="120";break;case "action:lock":code="223";break;
-            case "action:media_toggle":code="85";break;case "action:media_next":code="87";break;case "action:media_previous":code="88";break;
-            case "action:volume_up":code="24";break;case "action:volume_down":code="25";break;
+            case "action:media_toggle": audioKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE); return;
+            case "action:media_next": audioKey(KeyEvent.KEYCODE_MEDIA_NEXT); return;
+            case "action:media_previous": audioKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS); return;
+            case "action:volume_up": audioKey(KeyEvent.KEYCODE_VOLUME_UP); return;
+            case "action:volume_down": audioKey(KeyEvent.KEYCODE_VOLUME_DOWN); return;
         }
         if(code!=null){Helper.command("/system/bin/input","keyevent",code);return;}
         if(action.equals("action:notifications")||action.equals("action:quick_settings")){Helper.command("/system/bin/cmd","statusbar",action.equals("action:notifications")?"expand-notifications":"expand-settings");return;}
@@ -248,17 +337,19 @@ final class DeviceActions {
                 return;
         }
         if(action.equals("action:torch") || action.equals("action:pause_torch")){
-            prepareLight(ctx);
-            synchronized (light) {
-                if (light.enabled == null || light.changing()) throw new IllegalStateException("Flashlight unavailable or changing");
-                if (action.equals("action:pause_torch") && !light.enabled && mediaPlaying()) {
-                    Helper.command("/system/bin/input", "keyevent", "KEYCODE_MEDIA_PAUSE");
-                    return;
+            TorchWatch torch = heldTorch != null ? heldTorch : openTorch(ctx);
+            try {
+                synchronized (torch) {
+                    if (torch.state.enabled == null || torch.state.changing())
+                        throw new IllegalStateException("Flashlight unavailable or changing");
+                    if (action.equals("action:pause_torch") && !torch.state.enabled && mediaPlaying()) {
+                        audioKey(KeyEvent.KEYCODE_MEDIA_PAUSE);
+                        return;
+                    }
+                    torch.set(!torch.state.enabled, false);
+                    heldTorch = null;
                 }
-                boolean desired = !light.enabled;
-                camera.setTorchMode(cameraId, desired);
-                light.requested(desired, false);
-            }
+            } finally { if (heldTorch != torch) torch.close(); }
             return;
         }
         AudioManager audio=(AudioManager)ctx.getSystemService(Context.AUDIO_SERVICE);
@@ -369,6 +460,5 @@ final class DeviceActions {
     static synchronized void shutdown(){
         endHold("action:record");
         endHold("action:torch");
-        if(cameraThread!=null)cameraThread.quitSafely();
     }
 }

@@ -8,6 +8,9 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.pm.ServiceInfo;
 import android.service.quicksettings.TileService;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -17,20 +20,9 @@ final class QuickTiles {
         try { specs = android.provider.Settings.Secure.getString(context.getContentResolver(), "sysui_qs_tiles"); }
         catch (SecurityException ignored) { }
         if (specs == null) {
-            java.io.File dir = context.getExternalFilesDir(null);
-            if (dir != null) try {
-                String token = java.util.UUID.randomUUID().toString();
-                java.io.File request = new java.io.File(dir, "tile-query");
-                java.io.File reply = new java.io.File(dir, "tile-reply");
-                java.nio.file.Files.write(request.toPath(), java.util.Collections.singletonList(token));
-                for (int retry = 0; retry < 30; retry++) {
-                    if (reply.isFile()) {
-                        List<String> lines = java.nio.file.Files.readAllLines(reply.toPath());
-                        if (lines.size() == 2 && token.equals(lines.get(0))) { specs = lines.get(1); break; }
-                    }
-                    Thread.sleep(50);
-                }
-            } catch (java.io.IOException ignored) { }
+            File dir = context.getExternalFilesDir(null);
+            if (dir != null) try { specs = requestPinned(dir); }
+            catch (IOException ignored) { }
             catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
         }
         java.util.Set<String> result = new java.util.HashSet<>();
@@ -42,6 +34,20 @@ final class QuickTiles {
         }
         return result;
     }
+    // Older helpers also use a single query slot and echo the request token.
+    private static synchronized String requestPinned(File dir) throws IOException, InterruptedException {
+        if (Thread.interrupted()) throw new InterruptedException();
+        String token = java.util.UUID.randomUUID().toString();
+        File reply = new File(dir, "tile-reply");
+        try (MailboxEvents.Reply changed = new MailboxEvents.Reply(dir, reply.getName())) {
+            Files.write(new File(dir, "tile-query").toPath(), java.util.Collections.singletonList(token));
+            return changed.await(1500, () -> {
+                List<String> lines = Files.readAllLines(reply.toPath());
+                return lines.size() == 2 && token.equals(lines.get(0)) ? lines.get(1) : null;
+            }, value -> true);
+        }
+    }
+
     static List<ResolveInfo> discover(Context context, String owner) {
         Intent intent = new Intent(TileService.ACTION_QS_TILE).setPackage(owner);
         List<ResolveInfo> tiles = new ArrayList<>();

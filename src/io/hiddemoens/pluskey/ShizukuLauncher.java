@@ -47,31 +47,27 @@ public final class ShizukuLauncher extends Binder {
     private synchronized void startHelper() throws IOException, InterruptedException {
         String version = control("VERSION");
         if (Helper.VERSION.equals(version) && control("STATUS").startsWith("Listening|")) return;
+        File dir = Helper.MAILBOX_DIR;
+        Mailbox box = new Mailbox(dir);
         if (!version.isEmpty()) {
-            Control.request("STOP");
-            for (int i = 0; i < 20 && !control("VERSION").isEmpty(); i++) Thread.sleep(100);
-            if (!control("VERSION").isEmpty()) throw new IOException("Previous helper did not stop");
+            try (MailboxEvents.Reply stopped = new MailboxEvents.Reply(dir, Mailbox.STATUS_FILE)) {
+                Control.request("STOP");
+                stopped.awaitStopped(box);
+            }
         }
         File discard = new File("/dev/null");
         ProcessBuilder process = new ProcessBuilder("/system/bin/setsid", "/system/bin/app_process",
                 "/", Helper.class.getName(), Integer.toString(appUid), "shizuku")
                 .redirectInput(discard).redirectOutput(discard).redirectError(discard);
         process.environment().put("CLASSPATH", apk);
-        Process helper = process.start();
-        boolean ready = false;
-        try {
-            for (int i = 0; i < 25 && helper.isAlive(); i++) {
-                String status = control("STATUS");
-                if (status.startsWith("Listening|")) {
-                    ready = true;
-                    return;
-                }
-                if (status.startsWith("Error|")) throw new IOException(status.split("\\|", 3)[2]);
-                Thread.sleep(200);
+        try (MailboxEvents.Reply started = new MailboxEvents.Reply(dir, Mailbox.STATUS_FILE)) {
+            Process helper = process.start();
+            try {
+                started.awaitReady(box);
+            } catch (IOException | InterruptedException error) {
+                helper.destroy();
+                throw error;
             }
-            throw new IOException("Helper did not become ready through Shizuku");
-        } finally {
-            if (!ready) helper.destroy();
         }
     }
 

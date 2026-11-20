@@ -32,7 +32,7 @@ final class ShizukuConnection {
 
     static void start(Context context) throws Exception {
         Shizuku.UserServiceArgs args = new Shizuku.UserServiceArgs(new ComponentName(context, ShizukuLauncher.class))
-                .daemon(false).processNameSuffix("shizuku_launcher").version(1);
+                .daemon(false).processNameSuffix("shizuku_launcher").version(BuildConfig.VERSION_CODE);
         CompletableFuture<IBinder> service = new CompletableFuture<>();
         ServiceConnection connection = new ServiceConnection() {
             @Override public void onServiceConnected(ComponentName name, IBinder binder) {

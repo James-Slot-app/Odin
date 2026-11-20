@@ -99,10 +99,22 @@ public final class PatternTest {
         hold(); expect("-"); capturing = true; up(); expect("up");
     }
 
+    private void shortOnly() {
+        capturing = false;
+        configure(".");
+        int scheduled = tasks.size();
+        dot(); expect(".");
+        down(); time += 600; up(); expect();
+        check(tasks.size() == scheduled, "short-only configuration schedules no timers");
+        capturing = true;
+        hold(); up(); expect("capture:-");
+        capturing = false;
+    }
+
     public static void main(String[] args) {
         encoding();
         PatternTest test = new PatternTest();
-        try { test.recognition(); test.captureAndReset(); }
+        try { test.recognition(); test.captureAndReset(); test.shortOnly(); }
         finally { test.timer.shutdownNow(); }
         System.out.println("Pattern tests passed");
     }

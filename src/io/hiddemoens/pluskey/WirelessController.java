@@ -169,8 +169,7 @@ final class WirelessController {
             int uid = context.getApplicationInfo().uid;
             try (MailboxEvents.Reply started = new MailboxEvents.Reply(dir, Mailbox.STATUS_FILE)) {
                 shell(identity, "CLASSPATH=/data/local/tmp/plus-lens-helper.apk /system/bin/setsid /system/bin/nohup /system/bin/app_process / io.hiddemoens.pluskey.Helper " + uid
-                    + " </dev/null >/data/local/tmp/plus-lens.log 2>&1 &");
-                started.awaitReady(box);
+                    + " </dev/null >/data/local/tmp/plus-lens.log 2>&1 & read -r ready", () -> started.awaitReady(box));
                 stage("Helper ready");
             }
         } finally {
@@ -184,11 +183,20 @@ final class WirelessController {
         throw new IOException(pairing ? "Keep Pair device with pairing code window open" : "Enable Wireless debugging; use manual connection port if discovery fails");
     }
     private String shell(AdbIdentity identity, String command) throws Exception {
+        return shell(identity, command, null);
+    }
+    private String shell(AdbIdentity identity, String command, Work awaitHelper) throws Exception {
         io.github.muntashirakon.adb.AdbConnection connection = identity.getAdbConnection();
         Thread operation = Thread.currentThread();
         // Close captured transport directly: openStream may hold manager lock.
         ScheduledFuture<?> deadline = timer.schedule(() -> { operation.interrupt(); try { if(connection!=null)connection.close(); } catch (IOException ignored) { } }, 8, TimeUnit.SECONDS);
         try (AdbStream stream = identity.openStream("shell,raw:" + command); InputStream input = stream.openInputStream()) {
+            // adbd can tear down the launch shell's process group before setsid runs.
+            // Release the waiting shell only after the detached helper reports ready.
+            if (awaitHelper != null) {
+                awaitHelper.run();
+                stream.write(new byte[]{'\n'}, 0, 1);
+            }
             ByteArrayOutputStream output = new ByteArrayOutputStream();
             byte[] bytes = new byte[2048]; int size;
             while ((size = input.read(bytes)) != -1) {
